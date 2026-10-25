@@ -20,6 +20,8 @@ function _common_timestamps(dp::Union{<:EHDriftPath{T}, Vector{<:EHDriftPath{T}}
     range(zero(Δt), step = Δt, stop = typeof(Δt)(_common_time(dp)) + Δt)
 end
 
+# Field objects used by the drift only need `get_velocity_vector(field, pt)`; the Interpolations-based methods below
+# are the default, device field types provide their own.
 @inline function get_velocity_vector(velocity_field::Interpolations.Extrapolation{<:StaticVector{3}, 3}, pt::CartesianPoint{T})::CartesianVector{T} where {T <: SSDFloat}
     return CartesianVector{T}(velocity_field(pt.x, pt.y, pt.z))
 end
@@ -31,9 +33,10 @@ end
 
 function _drift_charges(det::SolidStateDetector{T}, grid::Grid{T, 3}, point_types::PointTypes{T, 3},
                         starting_points::VectorOfArrays{CartesianPoint{T}}, energies::VectorOfArrays{T},
-                        electric_field::Interpolations.Extrapolation{<:SVector{3}, 3},
+                        electric_field,
                         Δt::RQ; max_nsteps::Int = 2000, diffusion::Bool = false, self_repulsion::Bool = false, 
-                        end_drift_when_no_field::Bool = true, geometry_check::Bool = false, verbose::Bool = true)::Vector{EHDriftPath{T}} where {T <: SSDFloat, RQ <: RealQuantity}
+                        end_drift_when_no_field::Bool = true, geometry_check::Bool = false, verbose::Bool = true,
+                        rng::AbstractRNG = Random.default_rng())::Vector{EHDriftPath{T}} where {T <: SSDFloat, RQ <: RealQuantity}
 
     drift_paths::Vector{EHDriftPath{T}} = Vector{EHDriftPath{T}}(undef, length(flatview(starting_points)))
     dt::T = T(to_internal_units(Δt))
@@ -50,8 +53,8 @@ function _drift_charges(det::SolidStateDetector{T}, grid::Grid{T, 3}, point_type
         timestamps_e::Vector{T} = Vector{T}(undef, max_nsteps)
         timestamps_h::Vector{T} = Vector{T}(undef, max_nsteps)
         
-        n_e::Int = _drift_charge!( drift_path_e, timestamps_e, det, point_types, grid, start_points, -charges, dt, electric_field, Electron; diffusion, self_repulsion, end_drift_when_no_field, geometry_check, verbose )
-        n_h::Int = _drift_charge!( drift_path_h, timestamps_h, det, point_types, grid, start_points,  charges, dt, electric_field, Hole; diffusion, self_repulsion, end_drift_when_no_field, geometry_check, verbose )
+        n_e::Int = _drift_charge!( drift_path_e, timestamps_e, det, point_types, grid, start_points, -charges, dt, electric_field, Electron; diffusion, self_repulsion, end_drift_when_no_field, geometry_check, verbose, rng )
+        n_h::Int = _drift_charge!( drift_path_h, timestamps_h, det, point_types, grid, start_points,  charges, dt, electric_field, Hole; diffusion, self_repulsion, end_drift_when_no_field, geometry_check, verbose, rng )
         
         for i in eachindex(start_points)
             drift_paths[drift_path_counter + i] = EHDriftPath{T}( drift_path_e[i,1:n_e], drift_path_h[i,1:n_h], timestamps_e[1:n_e], timestamps_h[1:n_h] )
@@ -67,7 +70,26 @@ function modulate_surface_drift(p::CartesianVector{T})::CartesianVector{T} where
     return p
 end
 
-function modulate_driftvector(sv::CartesianVector{T}, pt::CartesianPoint{T}, vdv::Vector{<:AbstractVirtualVolume{T}})::CartesianVector{T} where {T <: SSDFloat}
+"""
+    _slide_along_boundary(pos, step_vector, surface_normal, semiconductor) -> (next_pos, n_shrink)
+
+Drift step of a charge at a floating boundary: the step is projected onto the boundary plane and shortened in
+0.1 % decrements until the new position is inside `semiconductor` (anything supporting `in`).
+`n_shrink == 1000` means no inside position was found.
+"""
+@inline function _slide_along_boundary(pos::CartesianPoint{T}, step_vector::CartesianVector{T}, surface_normal::CartesianVector{T}, semiconductor)::Tuple{CartesianPoint{T}, Int} where {T <: SSDFloat}
+    projected_vector::CartesianVector{T} = modulate_surface_drift(CartesianVector{T}(project_to_plane(step_vector, surface_normal)))
+    next_pos::CartesianPoint{T} = pos + projected_vector
+    small_projected_vector::CartesianVector{T} = projected_vector * T(0.001)
+    i::Int = 0
+    while i < 1000 && !(next_pos in semiconductor)
+        next_pos -= small_projected_vector
+        i += 1
+    end
+    next_pos, i
+end
+
+function modulate_driftvector(sv::CartesianVector{T}, pt::CartesianPoint{T}, vdv::Union{AbstractVector{<:AbstractVirtualVolume{T}}, Tuple{Vararg{AbstractVirtualVolume{T}}}})::CartesianVector{T} where {T <: SSDFloat}
     for i in eachindex(vdv)
         if in(pt, vdv[i])
             return modulate_driftvector(sv, pt, vdv[i])
@@ -96,7 +118,7 @@ function _set_to_zero_vector!(v::Vector{CartesianVector{T}})::Nothing where {T <
 end
 
 function _add_fieldvector_drift!(step_vectors::Vector{CartesianVector{T}}, current_pos::Vector{CartesianPoint{T}}, done::Vector{Bool}, 
-    electric_field::Interpolations.Extrapolation{<:StaticVector{3}, 3}, det::SolidStateDetector{T}, ::Type{S}, end_drift_when_no_field::Bool = true)::Nothing where {T, S}
+    electric_field, det::SolidStateDetector{T}, ::Type{S}, end_drift_when_no_field::Bool = true)::Nothing where {T, S}
     for n in eachindex(step_vectors)
        if !done[n]
            step_vectors[n] += get_velocity_vector(electric_field, _convert_point(current_pos[n], S))
@@ -106,16 +128,26 @@ function _add_fieldvector_drift!(step_vectors::Vector{CartesianVector{T}}, curre
     nothing
 end
 
-function _add_fieldvector_diffusion!(step_vectors::Vector{CartesianVector{T}}, done::Vector{Bool}, length::T = T(0.5e3))::Nothing where {T <: SSDFloat}
+"""
+    _diffusion_vector(length::T, u1::T, u2::T)
+
+Isotropic random step of length `length` from two uniform random numbers `u1, u2 ∈ [0, 1)`
+(direction: cosθ = 2u1 - 1, φ = 2π u2). Shared by the CPU loop and device kernels, which supply their own RNG.
+"""
+@inline function _diffusion_vector(length::T, u1::T, u2::T)::CartesianVector{T} where {T <: SSDFloat}
+    sinθ::T, cosθ::T = sincos(acos(T(2*u1 - 1)))
+    sinφ::T, cosφ::T = sincos(T(u2*2π))
+    CartesianVector{T}( length * cosφ * sinθ, length * sinφ * sinθ, length * cosθ )
+end
+
+function _add_fieldvector_diffusion!(step_vectors::Vector{CartesianVector{T}}, done::Vector{Bool}, length::T = T(0.5e3), rng::AbstractRNG = Random.default_rng())::Nothing where {T <: SSDFloat}
     for n in eachindex(step_vectors)
         if done[n] continue end
-        sinθ::T, cosθ::T = sincos(acos(T(2*rand() - 1)))
-        sinφ::T, cosφ::T = sincos(T(rand()*2π))
-        step_vectors[n] += CartesianVector{T}( length * cosφ * sinθ, length * sinφ * sinθ, length * cosθ )
+        step_vectors[n] += _diffusion_vector(length, T(rand(rng)), T(rand(rng)))
     end
     nothing 
 end
-function _add_fieldvector_diffusion!(step_vectors::Vector{CartesianVector{T}}, done::Vector{Bool}, Δt::T, cdm::AbstractChargeDriftModel{T}, current_pos::Vector{CartesianPoint{T}}, crystal_temperature::T, ::Type{CC})::Nothing where {T <: SSDFloat, CC <: ChargeCarrier}
+function _add_fieldvector_diffusion!(step_vectors::Vector{CartesianVector{T}}, done::Vector{Bool}, Δt::T, cdm::AbstractChargeDriftModel{T}, current_pos::Vector{CartesianPoint{T}}, crystal_temperature::T, ::Type{CC}, rng::AbstractRNG = Random.default_rng())::Nothing where {T <: SSDFloat, CC <: ChargeCarrier}
     for n in eachindex(step_vectors)
         if done[n] continue end
 
@@ -123,9 +155,7 @@ function _add_fieldvector_diffusion!(step_vectors::Vector{CartesianVector{T}}, d
         D = mu*crystal_temperature*kB/elementary_charge # D in m^2/s
         length = sqrt(6*D*Δt)
 
-        sinθ::T, cosθ::T = sincos(acos(T(2*rand() - 1)))
-        sinφ::T, cosφ::T = sincos(T(rand()*2π))
-        step_vectors[n] += CartesianVector{T}( length * cosφ * sinθ, length * sinφ * sinθ, length * cosθ )
+        step_vectors[n] += _diffusion_vector(T(length), T(rand(rng)), T(rand(rng)))
     end
     nothing 
 end
@@ -150,7 +180,7 @@ function _add_fieldvector_selfrepulsion!(step_vectors::Vector{CartesianVector{T}
     nothing
 end
 
-function _modulate_driftvectors!(step_vectors::Vector{CartesianVector{T}}, current_pos::Vector{CartesianPoint{T}}, vdv::Vector{V})::Nothing where {T <: SSDFloat, V <: AbstractVirtualVolume{T}}
+function _modulate_driftvectors!(step_vectors::Vector{CartesianVector{T}}, current_pos::Vector{CartesianPoint{T}}, vdv::Union{AbstractVector{<:AbstractVirtualVolume{T}}, Tuple{Vararg{AbstractVirtualVolume{T}}}})::Nothing where {T <: SSDFloat}
     for n in eachindex(step_vectors)
         step_vectors[n] = modulate_driftvector(step_vectors[n], current_pos[n], vdv)
     end
@@ -158,19 +188,10 @@ function _modulate_driftvectors!(step_vectors::Vector{CartesianVector{T}}, curre
 end
 _modulate_driftvectors!(step_vectors::Vector{CartesianVector{T}}, current_pos::Vector{CartesianPoint{T}}, ::Missing) where {T <: SSDFloat} = nothing
 
-function _get_driftvectors!(step_vectors::Vector{CartesianVector{T}}, done::Vector{Bool}, Δt::T, cdm::AbstractChargeDriftModel{T}, current_pos::Vector{CartesianPoint{T}}, ::Type{Electron})::Nothing where {T <: SSDFloat}
+function _get_driftvectors!(step_vectors::Vector{CartesianVector{T}}, done::Vector{Bool}, Δt::T, cdm::AbstractChargeDriftModel{T}, current_pos::Vector{CartesianPoint{T}}, ::Type{CC})::Nothing where {T <: SSDFloat, CC <: ChargeCarrier}
     for n in eachindex(step_vectors)
         if !done[n]
-            step_vectors[n] = getVe(SVector{3,T}(step_vectors[n]), cdm, current_pos[n]) * Δt
-        end
-    end
-    nothing
-end
-
-function _get_driftvectors!(step_vectors::Vector{CartesianVector{T}}, done::Vector{Bool}, Δt::T, cdm::AbstractChargeDriftModel{T}, current_pos::Vector{CartesianPoint{T}}, ::Type{Hole})::Nothing where {T <: SSDFloat}
-    for n in eachindex(step_vectors)
-        if !done[n]
-            step_vectors[n] = getVh(SVector{3,T}(step_vectors[n]), cdm, current_pos[n]) * Δt
+            step_vectors[n] = getV(SVector{3,T}(step_vectors[n]), cdm, current_pos[n], CC) * Δt
         end
     end
     nothing
@@ -217,18 +238,11 @@ function _check_and_update_position!(
                 end
             end
             if cd_point_type == CD_FLOATING_BOUNDARY
-                projected_vector::CartesianVector{T} = CartesianVector{T}(project_to_plane(step_vectors[n], surface_normal))
-                projected_vector = modulate_surface_drift(projected_vector)
-                next_pos::CartesianPoint{T} = current_pos[n] + projected_vector
-                small_projected_vector = projected_vector * T(0.001)
-                i::Int = 0
-                while i < 1000 && !(next_pos in det.semiconductor)
-                    next_pos -= small_projected_vector
-                    i += 1
-                end
+                next_pos::CartesianPoint{T}, i::Int = _slide_along_boundary(current_pos[n], step_vectors[n], surface_normal, det.semiconductor)
                 if i == 1000
                     if verbose @warn("Handling of charge at floating boundary did not work as intended. Start Position (Cart): $(startpos[n])") end
                     done[n] = true
+                    drift_path[n,istep] = current_pos[n]   # was left uninitialised
                     continue
                 end
                 drift_path[n,istep] = next_pos
@@ -262,13 +276,14 @@ function _drift_charge!(
                             startpos::AbstractVector{CartesianPoint{T}},
                             charges::Vector{T},
                             Δt::T,
-                            electric_field::Interpolations.Extrapolation{<:StaticVector{3}, 3},
+                            electric_field,
                             ::Type{CC};
                             diffusion::Bool = false,
                             self_repulsion::Bool = false,
                             end_drift_when_no_field::Bool = true,
                             geometry_check::Bool = false,
-                            verbose::Bool = true
+                            verbose::Bool = true,
+                            rng::AbstractRNG = Random.default_rng()
                         )::Int where {T <: SSDFloat, S, CC <: ChargeCarrier}
                         
     n_hits::Int, max_nsteps::Int = size(drift_path)
@@ -325,7 +340,7 @@ function _drift_charge!(
         _add_fieldvector_drift!(step_vectors, current_pos, done, electric_field, det, S, end_drift_when_no_field)
         self_repulsion && _add_fieldvector_selfrepulsion!(step_vectors, current_pos, done, charges, ϵ_r)
         _get_driftvectors!(step_vectors, done, Δt, cdm, current_pos, CC)
-        diffusion && (use_mobility_tied_diffusion ? _add_fieldvector_diffusion!(step_vectors, done, Δt, cdm, current_pos, crystal_temperature, CC) : _add_fieldvector_diffusion!(step_vectors, done, diffusion_length))
+        diffusion && (use_mobility_tied_diffusion ? _add_fieldvector_diffusion!(step_vectors, done, Δt, cdm, current_pos, crystal_temperature, CC, rng) : _add_fieldvector_diffusion!(step_vectors, done, diffusion_length, rng))
         _modulate_driftvectors!(step_vectors, current_pos, det.virtual_drift_volumes)
         _check_and_update_position!(step_vectors, current_pos, done, normal, drift_path, timestamps, istep, det, grid, point_types, startpos, Δt, geometry_check, verbose)
         if all(done) break end
@@ -340,6 +355,35 @@ const CD_OUTSIDE = 0x01
 const CD_BULK = 0x02
 const CD_FLOATING_BOUNDARY = 0x04 # not 0x03, so that one could use bit operations here...
 
+
+# Candidate crossing point `pt` of the segment pt_in -> pt_out with a contact surface `surf`:
+# replaces `best` if it lies in `contact` (anything supporting `in`), within the segment, and closer to pt_in than `best`.
+@inline function _contact_crossing_candidate(pt::CartesianPoint{T}, surf, contact, pt_in::CartesianPoint{T}, direction::CartesianVector{T},
+                                             best::Tuple{CartesianPoint{T}, UInt8, CartesianVector{T}}) where {T <: SSDFloat}
+    if  0 ≤ (pt - pt_in) ⋅ direction ≤ 1 &&              # pt within pt_in and pt_out (cheap tests first)
+        norm(pt - pt_in) < norm(best[1] - pt_in) &&      # pt closer to pt_in than previous best
+        pt in contact
+        return (pt, CD_ELECTRODE, normalize(ConstructiveSolidGeometry.normal(surf, pt)))
+    end
+    best
+end
+
+# Candidate crossing point `pt` with a semiconductor surface `surf`: replaces `best` if the semiconductor lies
+# "before" and not "after" the point along the surface normal, within the segment and closer than `best`;
+# the type is CD_ELECTRODE at a fixed grid node (`point_types[pt] & update_bit == 0`), CD_FLOATING_BOUNDARY otherwise.
+@inline function _semiconductor_crossing_candidate(pt::CartesianPoint{T}, surf, semiconductor, point_types, pt_in::CartesianPoint{T}, direction::CartesianVector{T},
+                                                   best::Tuple{CartesianPoint{T}, UInt8, CartesianVector{T}}) where {T <: SSDFloat}
+    (0 ≤ (pt - pt_in) ⋅ direction ≤ 1 &&             # pt within pt_in and pt_out (cheap tests first)
+     norm(pt - pt_in) < norm(best[1] - pt_in)) ||    # pt closer to pt_in than previous best
+        return best
+    tol::T = 5000 * ConstructiveSolidGeometry.csg_default_tol(T)
+    normal::CartesianVector{T} = normalize(ConstructiveSolidGeometry.normal(surf, pt))
+    if pt + tol * normal in semiconductor &&         # point "before" crossing_pos should be in
+       !(pt - tol * normal in semiconductor)         # point "after" crossing_pos should be out
+        return (pt, point_types[pt] & update_bit == 0 ? CD_ELECTRODE : CD_FLOATING_BOUNDARY, normal)
+    end
+    best
+end
 
 function get_crossing_pos(  det::SolidStateDetector{T}, point_types::PointTypes{T, 3, S}, pt_in::CartesianPoint{T}, pt_out::CartesianPoint{T};
                             max_n_iter::Int = 500)::Tuple{CartesianPoint{T}, UInt8, CartesianVector{T}} where {T <: SSDFloat, S}
@@ -357,29 +401,17 @@ function get_crossing_pos(  det::SolidStateDetector{T}, point_types::PointTypes{
     for contact in det.contacts
         for surf in ConstructiveSolidGeometry.surfaces(contact.geometry)
             for pt in ConstructiveSolidGeometry.intersection(surf, line)
-                if pt in contact && 
-                    0 ≤ (pt - pt_in) ⋅ direction ≤ 1 &&              # pt within pt_in and pt_out
-                    norm(pt - pt_in) < norm(crossing_pos[1] - pt_in) # pt closer to pt_in that previous crossing_pos
-                    crossing_pos = (pt, CD_ELECTRODE, normalize(ConstructiveSolidGeometry.normal(surf, pt)))
-                end
+                crossing_pos = _contact_crossing_candidate(pt, surf, contact, pt_in, direction, crossing_pos)
             end
         end
     end
     
     # if the Line does not intersect with a surface of a Contact, check if it does intersect with the surface of the Semiconductor
     if crossing_pos[2] & CD_OUTSIDE > 0 
-        tol::T = 5000 * ConstructiveSolidGeometry.csg_default_tol(T)
         # check if the Line intersects with a surface of the Semiconductor
         for surf in ConstructiveSolidGeometry.surfaces(det.semiconductor.geometry)
             for pt in ConstructiveSolidGeometry.intersection(surf, line)
-                normal = normalize(ConstructiveSolidGeometry.normal(surf, pt))
-                if pt + tol * normal in det.semiconductor &&         # point "before" crossing_pos should be in
-                   !(pt - tol * normal in det.semiconductor) &&      # point "after" crossing_pos should be out
-                    0 ≤ (pt - pt_in) ⋅ direction ≤ 1 &&              # pt within pt_in and pt_out
-                    norm(pt - pt_in) < norm(crossing_pos[1] - pt_in) # pt closer to pt_in that previous crossing_pos
-                    CD_POINTTYPE::UInt8 = point_types[pt] & update_bit == 0 ? CD_ELECTRODE : CD_FLOATING_BOUNDARY 
-                    crossing_pos = (pt, CD_POINTTYPE, normal)
-                end
+                crossing_pos = _semiconductor_crossing_candidate(pt, surf, det.semiconductor, point_types, pt_in, direction, crossing_pos)
             end 
         end
     end

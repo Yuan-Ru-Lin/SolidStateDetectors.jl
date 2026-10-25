@@ -21,15 +21,22 @@ This model is the default when no charge trapping model is defined in the config
 """
 struct NoChargeTrappingModel{T <: SSDFloat} <: AbstractChargeTrappingModel{T} end
 
-function _signal!(
+"""
+    _signal_step(ctm, q, w, running_sum; kwargs...) -> (signal_value, q, running_sum)
+
+One step of the signal calculation for charge trapping model `ctm`: the remaining charge `q` and the
+accumulated signal of already trapped charge `running_sum` are passed in and returned (no mutable state),
+so the same function serves the CPU loop and device kernels.
+"""
+function _signal_step(
     ::NoChargeTrappingModel{T},
-    q::Base.RefValue{T},
+    q::T,
     w::T,
-    ::Base.RefValue{T};
+    running_sum::T;
     kwargs...
 ) where {T <: SSDFloat}
     
-    return w * q[]
+    return w * q, q, running_sum
 end
 
 function _calculate_signal( 
@@ -43,12 +50,12 @@ function _calculate_signal(
 
     tmp_signal::Vector{T} = Vector{T}(undef, length(pathtimestamps))
 
-    q = Ref(charge)
-    running_sum = Ref(zero(T))
+    q::T = charge
+    running_sum::T = zero(T)
     
     @inbounds for i in eachindex(tmp_signal)
         w = get_interpolation(wpot, path[i], S)::T
-        tmp_signal[i] = _signal!(ctm, q, w, running_sum)
+        tmp_signal[i], q, running_sum = _signal_step(ctm, q, w, running_sum)
     end
 
     tmp_signal
@@ -77,20 +84,20 @@ struct BoggsChargeTrappingModel{T <: SSDFloat} <: AbstractChargeTrappingModel{T}
     temperature::T # in K
 end
 
-function _signal!(
+function _signal_step(
     ::BoggsChargeTrappingModel{T},
-    q::Base.RefValue{T},
+    q::T,
     w::T,
-    running_sum::Base.RefValue{T};
+    running_sum::T;
     nσ::T=zero(T),
     Δl::T=zero(T),
     kwargs...
 ) where {T <: SSDFloat}
 
-    Δq::T = q[] * nσ * Δl
-    q[] -= Δq
-    running_sum[] += w * Δq
-    return running_sum[] + w * q[]
+    Δq::T = q * nσ * Δl
+    q -= Δq
+    running_sum += w * Δq
+    return running_sum + w * q, q, running_sum
 end
 
 function _calculate_signal( 
@@ -104,8 +111,8 @@ function _calculate_signal(
 
     tmp_signal::Vector{T} = Vector{T}(undef, length(pathtimestamps))
 
-    q = Ref(charge)
-    running_sum = Ref(zero(T))
+    q::T = charge
+    running_sum::T = zero(T)
     
     vth::T = sqrt(3 * kB * ctm.temperature / (ifelse(charge > 0, ctm.meffh, ctm.meffe) * me)) # in m/s
     nσ::T = ifelse(charge > 0, ctm.nσh, ctm.nσe)
@@ -115,7 +122,7 @@ function _calculate_signal(
         Δl::T = Δldrift > 0 ? hypot(Δldrift, vth * (pathtimestamps[i] - pathtimestamps[i-1])) : zero(T)
         w::T = i > 1 ? get_interpolation(wpot, path[i], S) : zero(T)
 
-        tmp_signal[i] = _signal!( ctm, q, w, running_sum; nσ=nσ, Δl=Δl )
+        tmp_signal[i], q, running_sum = _signal_step(ctm, q, w, running_sum; nσ=nσ, Δl=Δl )
     end
 
     tmp_signal
@@ -193,20 +200,20 @@ function check_lifetime(model::AbstractChargeTrappingModel{T}, charge::T, pathti
     return τ
 end
 
-function _signal!(
+function _signal_step(
     ::ConstantLifetimeChargeTrappingModel{T},
-    q::Base.RefValue{T},
+    q::T,
     w::T,
-    running_sum::Base.RefValue{T};
+    running_sum::T;
     τ::T=T(Inf),
     Δt::T=zero(T),
     kwargs...
 ) where {T <: SSDFloat}
 
-    Δq::T = q[] * Δt / τ
-    q[] -= Δq
-    running_sum[] += w * Δq
-    return running_sum[] + w * q[]
+    Δq::T = q * Δt / τ
+    q -= Δq
+    running_sum += w * Δq
+    return running_sum + w * q, q, running_sum
 end
 
 function _calculate_signal( 
@@ -220,8 +227,8 @@ function _calculate_signal(
     
     tmp_signal::Vector{T} = Vector{T}(undef, length(pathtimestamps))
 
-    q = Ref(charge)
-    running_sum = Ref(zero(T))
+    q::T = charge
+    running_sum::T = zero(T)
 
     τ::T = check_lifetime(ctm, charge, pathtimestamps)
     
@@ -230,7 +237,7 @@ function _calculate_signal(
         Δt::T = (i > 1) ? (pathtimestamps[i] - pathtimestamps[i-1]) : zero(T)
         w::T = i > 1 ? get_interpolation(wpot, path[i], S) : zero(T)
         
-        tmp_signal[i] = _signal!( ctm, q, w, running_sum; τ=τ, Δt=Δt )
+        tmp_signal[i], q, running_sum = _signal_step(ctm, q, w, running_sum; τ=τ, Δt=Δt )
     end
  
     tmp_signal
@@ -294,8 +301,8 @@ function _calculate_signal(
     
     tmp_signal::Vector{T} = Vector{T}(undef, length(pathtimestamps))
 
-    q = Ref(charge)
-    running_sum = Ref(zero(T))
+    q::T = charge
+    running_sum::T = zero(T)
 
     inactive_layer_exist = !isnothing(ctm.inactive_layer_geometry) || has_inactive_layer(point_types.data)
 
@@ -331,10 +338,10 @@ function _calculate_signal(
         Δl::T = Δldrift > 0 ? hypot(Δldrift, vth * (pathtimestamps[i] - pathtimestamps[i-1])) : zero(T)
         
         if in_inactive_region
-            tmp_signal[i] = _signal!(ctm.inactive_charge_trapping_model, q, w, running_sum;
+            tmp_signal[i], q, running_sum = _signal_step(ctm.inactive_charge_trapping_model, q, w, running_sum;
                                      τ=τ_inactive, Δt=Δt)
         else
-            tmp_signal[i] = _signal!(ctm.bulk_charge_trapping_model, q, w, running_sum;
+            tmp_signal[i], q, running_sum = _signal_step(ctm.bulk_charge_trapping_model, q, w, running_sum;
                                      nσ=nσ, Δl=Δl, τ=τ, Δt=Δt)
         end
     end
